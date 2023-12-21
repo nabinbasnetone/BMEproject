@@ -1,0 +1,85 @@
+import paramiko
+import os
+import numpy as np
+from PIL import Image
+
+
+def raspido(action):
+    actionmap = {
+        1: "forward",
+        2: "backward",
+        3: "left",
+        4: "right"
+        # action:filename
+    }
+    action_name = actionmap[action]
+    command = f'python3 /home/robot/major_project/{action_name}.py'
+    stdin, stdout, stderr = ssh.exec_command(command)
+    print(f'{stdout.read().decode("utf8")}')
+
+
+def file_retriever(*file_name, close=False, cmd):
+    lis = []
+    for filename in file_name:
+        # 200*150 for all RL model
+        command = 'libcamera-jpeg -o test.jpg -t 1 --width 200 --height 150'
+        stdin, stdout, stderr = ssh.exec_command(command)
+        # Would not work without this line, Don't know why
+        print(f'{stdout.read().decode("utf8")}')
+
+        scp.get(r'/home/robot/test.jpg', rf'C:\Users\Acer\PycharmProjects\testproject\{filename}.jpg')
+        ssh.exec_command(f"rm test.jpg")
+
+        img = Image.open(f'{filename}.jpg')
+        nimg = np.array(img)
+        os.remove(f'{filename}.jpg')
+        lis.append(nimg)
+        raspido(cmd)
+    if close:
+        ssh.close()
+    return lis
+
+
+def imgsticher(cmd, toclose=False):
+    close = toclose
+    target = cmd
+    img0, img1, img2 = file_retriever(1, 2, 3, close=close, cmd=target)
+    nimg = np.concatenate((img0, img1, img2), axis=1)
+    img = Image.fromarray(nimg)
+    return img
+
+
+def for_reward(img1, img2):
+    img1 = np.array(img1)
+    img2 = np.array(img2)
+    return Image.fromarray(np.concatenate((img1, img2), axis=1))
+
+
+def main():
+    run = True
+    count = 0
+    firstnpimg = np.zeros([150, 600, 3],  dtype=np.uint8)
+    firstimg = Image.fromarray(firstnpimg)
+    while run:
+        target = int(input("Define response: "))
+        image = imgsticher(cmd=target)
+        value = int(input("define reward: "))
+        name = str(value) + str(count) + ".jpg"
+        imagere = for_reward(firstimg, image)
+        imagere.save(name)
+        count += 1
+        firstimg = image
+        reply = input("Do you want to continue: ")
+        if reply == "n":
+            run = False
+
+
+# from here code start
+pi_ip = '192.168.137.79'
+pi_username = 'robot'
+pi_password = 'robot'
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect(pi_ip, username=pi_username, password=pi_password)
+scp = paramiko.SFTPClient.from_transport(ssh.get_transport())
+main()
