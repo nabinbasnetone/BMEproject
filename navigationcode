@@ -1,24 +1,220 @@
+import torch as T
+from PIL import Image
+import torch.nn as nn
+import numpy as np
+import torch.optim as optim
+from torch.distributions.categorical import Categorical
+import torchvision.transforms as tt
 import paramiko
 import os
-import numpy as np
-from PIL import Image
 
 
-def raspido(action):
-    actionmap = {
-        1: "forward",
-        2: "backward",
-        3: "left",
-        4: "right"
-        # action:filename
-    }
-    action_name = actionmap[action]
-    command = f'python3 /home/robot/major_project/{action_name}.py'
-    stdin, stdout, stderr = ssh.exec_command(command)
-    print(f'{stdout.read().decode("utf8")}')
+def conv_block(in_channels, out_channels, pool=False):
+    layers = [nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+              nn.BatchNorm2d(out_channels),
+              nn.ReLU(inplace=True)]
+    if pool: layers.append(nn.MaxPool2d(2))
+    return nn.Sequential(*layers)
 
 
-def file_retriever(*file_name, close=False, cmd):
+def statetotensor(lis):
+    j = [tensor.detach().numpy() for tensor in lis]
+    return j
+
+
+class PPOMemory:
+    def __init__(self, batch_size):
+        self.states = []
+        self.probs = []
+        self.vals = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.batch_size = batch_size
+
+    def generate_batches(self):
+        n_states = len(self.states)
+        batch_start = np.arange(0, n_states, self.batch_size)
+        indices = np.arange(n_states, dtype=np.int64)
+        np.random.shuffle(indices)
+        batches = [indices[i:i+self.batch_size] for i in batch_start]
+        if isinstance(self.states[0], T.Tensor):
+            self.states = statetotensor(self.states)
+        return np.array(self.states), np.array(self.actions), np.array(self.probs),\
+                np.array(self.vals),\
+                np.array(self.rewards), \
+                np.array(self.dones), \
+                batches
+
+    def store_memory(self, state, action, probs, vals, reward, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.probs.append(probs)
+        self.vals.append(vals)
+        self.rewards.append(reward)
+        self.dones.append(done)
+
+    def clear_memory(self):
+        self.states = []
+        self.probs = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.vals = []
+
+
+class ActorNetwork(nn.Module):
+    def __init__(self, alpha):
+        super(ActorNetwork, self).__init__()
+        self.actor = nn.Sequential(
+                        conv_block(3, 8, pool=True),
+                        conv_block(8, 16, pool=True),
+                        nn.Sequential(conv_block(16, 16), conv_block(16, 16)),
+                        conv_block(16, 32, pool=True),
+                        conv_block(32, 64, pool=True),
+                        nn.Sequential(conv_block(64, 64), conv_block(64, 64)),
+                        conv_block(64, 128, pool=True),
+                        nn.Sequential(nn.MaxPool2d(4), nn.Flatten()),
+                        nn.Linear(512, 6),
+                        nn.Softmax(dim=-1)
+        )
+        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state):
+        dist = self.actor(state)
+        dist = Categorical(dist)
+        return dist
+
+
+class CriticNetwork(nn.Module):
+    def __init__(self, alpha):
+        super(CriticNetwork, self).__init__()
+        self.critic = nn.Sequential(
+                        conv_block(3, 8, pool=True),
+                        conv_block(8, 16, pool=True),
+                        nn.Sequential(conv_block(16, 16), conv_block(16, 16)),
+                        conv_block(16, 32, pool=True),
+                        conv_block(32, 64, pool=True),
+                        nn.Sequential(conv_block(64, 64), conv_block(64, 64)),
+                        conv_block(64, 128, pool=True),
+                        nn.Sequential(nn.MaxPool2d(4), nn.Flatten()),
+                        nn.Linear(512, 1)
+        )
+        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state):
+        value = self.critic(state)
+        return value
+
+
+class Agent:
+    def __init__(self, gamma=0.99, alpha=0.0003, gae_lambda=0.95,
+                        policy_clip=0.2, batch_size=5, n_epochs=5):
+        self.gamma = gamma
+        self.policy_clip = policy_clip
+        self.n_epochs = n_epochs
+        self.gae_lambda = gae_lambda
+        self.actor = ActorNetwork(alpha)
+        self.critic = CriticNetwork(alpha)
+        self.memory = PPOMemory(batch_size)
+
+    def remember(self, state, action, probs, vals, reward, done):
+        self.memory.store_memory(state, action, probs, vals, reward, done)
+
+    def choose_action(self, observation):
+        dist = self.actor(observation)
+        value = self.critic(observation)
+        action = dist.sample()
+        probs = T.squeeze(dist.log_prob(action)).item()
+        action = T.squeeze(action).item()
+        value = T.squeeze(value).item()
+        return action, probs, value
+
+    def learn(self):
+        for _ in range(self.n_epochs):
+            state_arr, action_arr, old_prob_arr, vals_arr,\
+            reward_arr, dones_arr, batches = self.memory.generate_batches()
+
+            values = vals_arr
+            advantage = np.zeros(len(reward_arr), dtype=np.float32)
+
+            for t in range(len(reward_arr)-1):
+                discount = 1
+                a_t = 0
+                for k in range(t, len(reward_arr)-1):
+                    a_t += discount*(reward_arr[k] + self.gamma*values[k+1]*(1-int(dones_arr[k])) - values[k])
+                    discount *= self.gamma*self.gae_lambda
+                advantage[t] = a_t
+            advantage = T.tensor(advantage).to(self.actor.device)
+
+            values = T.tensor(values).to(self.actor.device)
+            for batch in batches:
+                states = T.tensor(state_arr[batch], dtype=T.float).to(self.actor.device)
+                old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
+                actions = T.tensor(action_arr[batch]).to(self.actor.device)
+
+                dist = self.actor(states)
+                critic_value = self.critic(states)
+
+                critic_value = T.squeeze(critic_value)
+
+                new_probs = dist.log_prob(actions)
+                prob_ratio = new_probs.exp() / old_probs.exp()
+                weighted_probs = advantage[batch] * prob_ratio
+                weighted_clipped_probs = T.clamp(prob_ratio, 1-self.policy_clip, 1+self.policy_clip)*advantage[batch]
+                actor_loss = -T.min(weighted_probs, weighted_clipped_probs).mean()
+
+                returns = advantage[batch] + values[batch]
+                critic_loss = (returns-critic_value)**2
+                critic_loss = critic_loss.mean()
+                total_loss = actor_loss + 0.5*critic_loss
+
+                self.actor.optimizer.zero_grad()
+                self.critic.optimizer.zero_grad()
+                total_loss.backward()
+                self.actor.optimizer.step()
+                self.critic.optimizer.step()
+
+        self.memory.clear_memory()
+
+
+class Reward(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = conv_block(3, 8, pool=True)
+        self.conv2 = conv_block(8, 16, pool=True)
+        self.res1 = nn.Sequential(conv_block(16,16), conv_block(16,16))
+
+        self.conv3 = conv_block(16, 32, pool=True)
+        self.conv4 = conv_block(32, 64, pool=True)
+        self.res2 = nn.Sequential(conv_block(64, 64), conv_block(64, 64))
+
+        self.conv5 = conv_block(64, 128, pool=True)
+
+        self.classifier = nn.Sequential(nn.MaxPool2d(4),
+                                        nn.Flatten(),
+                                        nn.Dropout(0.2))
+        self.linear = nn.Linear(1152, 4)
+        # 0(reaching destiny) for 100, 1(for driving) for 1, 2(near miss) for -5, 3(collision) for -20, 4 (being out of field) for -10
+
+    def forward(self, xb):
+        out = self.conv1(xb)
+        out = self.conv2(out)
+        out = self.res1(out) + out
+        out = self.conv3(out)
+        out = self.conv4(out)
+        out = self.res2(out) + out
+        out = self.conv5(out)
+        out = self.classifier(out)
+        out = self.linear(out)
+        return out
+
+
+def file_retriever(*file_name, close=False):
     lis = []
     for filename in file_name:
         # 200*150 for all RL model
@@ -27,59 +223,101 @@ def file_retriever(*file_name, close=False, cmd):
         # Would not work without this line, Don't know why
         print(f'{stdout.read().decode("utf8")}')
 
-        scp.get(r'/home/robot/test.jpg', rf'C:\Users\Acer\PycharmProjects\testproject\{filename}.jpg')
+        scp.get(r'/home/robot/test.jpg', rf'C:\Users\Acer\PycharmProjects\NavigationModel\{filename}.jpg')
         ssh.exec_command(f"rm test.jpg")
 
         img = Image.open(f'{filename}.jpg')
-        nimg = np.array(img)
+        imgtotensor = tt.ToTensor()
+        img = imgtotensor(img)
         os.remove(f'{filename}.jpg')
-        lis.append(nimg)
-        raspido(cmd)
+        lis.append(img)
     if close:
         ssh.close()
     return lis
 
 
-def imgsticher(cmd, toclose=False):
+def raspido(action):
+    actionmap = {
+        # action:filename
+        0: "forward",
+        1: "forward",
+        2: "backward",
+        3: "left",
+        4: "right",
+        5: "forward"
+    }
+    action_name = actionmap[action]
+    command = f'python3 /home/robot/major_project/{action_name}.py'
+    stdin, stdout, stderr = ssh.exec_command(command)
+    print(f'{stdout.read().decode("utf8")}')
+
+
+def imgsticher(toclose=False):
     close = toclose
-    target = cmd
-    img0, img1, img2 = file_retriever(1, 2, 3, close=close, cmd=target)
-    nimg = np.concatenate((img0, img1, img2), axis=1)
-    img = Image.fromarray(nimg)
+    img0, img1, img2 = file_retriever(1, 2, 3, close=close)
+    img = T.cat((img0, img1, img2), -1)
+    img = img.unsqueeze(0)
     return img
 
 
-def for_reward(img1, img2):
-    img1 = np.array(img1)
-    img2 = np.array(img2)
-    return Image.fromarray(np.concatenate((img1, img2), axis=1))
+def reward_m(rewardmodel, obs, obs_):
+    obs1 = obs
+    obs2 = obs_
+    obs3 = T.cat((obs1, obs2), -1)
+    rewardlist = rewardmodel(obs3)
+    reward = T.argmax(rewardlist)
+    if reward == 0:
+        return 100, True
+    elif reward == 1:
+        return 1, False
+    elif reward == 2:
+        return -5, False
+    elif reward == 3:
+        return -20, False
 
 
 def main():
-    run = True
-    count = 0
-    firstnpimg = np.zeros([150, 600, 3],  dtype=np.uint8)
-    firstimg = Image.fromarray(firstnpimg)
-    while run:
-        target = int(input("Define response: "))
-        image = imgsticher(cmd=target)
-        value = int(input("define reward: "))
-        name = str(value) + str(count) + ".jpg"
-        imagere = for_reward(firstimg, image)
-        imagere.save(name)
-        count += 1
-        firstimg = image
-        reply = input("Do you want to continue: ")
-        if reply == "n":
-            run = False
+    agent = Agent()
+    rewardmodel = Reward()
+    rewardmodel.load_state_dict(T.load(r'C:\Users\Acer\Downloads\rmodel.pth'))
+    rewardmodel.eval()
+    N = 20
+    n_steps = 0
+    finish = False
+    while not finish:
+        track = str(input("Do you want to continue training: "))
+        if track != "y":
+            break
+        observation = imgsticher()
+        count = 3
+        done = False
+        while count and not done:
+            action, prob, val = agent.choose_action(observation)
+            print(action)
+            raspido(action)
+            observation_ = imgsticher()
+            reward, done = reward_m(rewardmodel, observation, observation_)
+            n_steps += 1
+            agent.remember(observation.squeeze(0), action, prob, val, reward, done)
+            agent.learn()
+            if n_steps % N == 0:
+                agent.learn()
+            count -= 1
+            observation = observation_
 
 
-# from here code start
+# For SSH connection
 pi_ip = '192.168.137.79'
 pi_username = 'robot'
 pi_password = 'robot'
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 ssh.connect(pi_ip, username=pi_username, password=pi_password)
+# For transfer
 scp = paramiko.SFTPClient.from_transport(ssh.get_transport())
+
 main()
+
+
+# depending on the motion of vehicle adjust the camera click command
+##
