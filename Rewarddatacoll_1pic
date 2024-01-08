@@ -1,0 +1,75 @@
+import numpy as np
+import paramiko
+from PIL import Image
+
+
+def raspido(action):
+    actionmap = {
+        0: 'stay',
+        1: "forward",
+        2: "backward",
+        3: "left",
+        4: "right"
+    }
+    action_name = actionmap[action]
+    command = f'sudo python3 /home/robot/major_project/{action_name}.py'
+    stdin, stdout, stderr = ssh.exec_command(command)
+    print(f'{stdout.read().decode("utf8")}')
+
+
+def file_retriever():
+    scp.get(r'/home/robot/test.jpg', r'C:\Users\Acer\PycharmProjects\testproject\img.jpg')
+    ssh.exec_command("rm test.jpg")
+    img = Image.open('img.jpg')
+    numpyimg = np.array(img)
+    return numpyimg
+
+
+def for_reward(img1, img2, color):
+    colorlist = [0, 1, 2]
+    npimg = np.concatenate((img1, img2), axis=1)
+    for i in colorlist:
+        if i == color:
+            npimg[0:10, 0:800, i] = 255
+            npimg[290:300, 0:800, i] = 255
+            npimg[0:300, 0:10, i] = 255
+            npimg[0:300, 790:800, i] = 255
+        else:
+            npimg[0:10, 0:800, i] = 0
+            npimg[290:300, 0:800, i] = 0
+            npimg[0:300, 0:10, i] = 0
+            npimg[0:300, 790:800, i] = 0
+    return Image.fromarray(npimg)
+
+
+def main():
+    run = True
+    count = 0
+    firstnpimg = np.zeros([300, 400, 3], dtype=np.uint8)
+    firstimg = Image.fromarray(firstnpimg)
+    color = int(input("define color: "))
+    while run:
+        target = int(input("Define response: "))
+        raspido(target)
+        image = file_retriever()
+        rewardvalue = int(input("define reward: "))
+        name = str(target) + str(rewardvalue) + "-" + str(count) + ".jpg"
+        imagere = for_reward(firstimg, image, color)
+        imagere.save(name)
+        count += 1
+        firstimg = image
+        if count == 20:
+            reply = input("Do you want to continue: ")
+            if reply == "n":
+                run = False
+
+
+# from here code start
+pi_ip = '192.168.137.163'
+pi_username = 'robot'
+pi_password = 'robot'
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect(pi_ip, username=pi_username, password=pi_password)
+scp = paramiko.SFTPClient.from_transport(ssh.get_transport())
+main()
