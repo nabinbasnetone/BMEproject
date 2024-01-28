@@ -138,7 +138,7 @@ class CriticNetwork(nn.Module):
 
 class Agent:
     def __init__(self, gamma=0.99, alpha=0.0003, gae_lambda=0.95,
-                 policy_clip=0.2, batch_size=10, n_epochs=50):
+                 policy_clip=0.2, batch_size=10, n_epochs=5):
         self.gamma = gamma
         self.policy_clip = policy_clip
         self.n_epochs = n_epochs
@@ -148,8 +148,8 @@ class Agent:
         # check which model you want to use
         self.actor.load_state_dict(T.load(r'C:\Users\Acer\PycharmProjects\NavigationModel\actor_2024-01-25.pth'))
         self.critic.load_state_dict(T.load(r'C:\Users\Acer\PycharmProjects\NavigationModel\critic_2024-01-25.pth'))
-        self.actor.eval()
-        self.critic.eval()
+        self.actor.train()
+        self.critic.train()
         self.memory = PPOMemory(batch_size)
 
     def remember(self, state, action, probs, vals, reward, done):
