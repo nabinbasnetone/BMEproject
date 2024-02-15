@@ -1,0 +1,334 @@
+import paramiko
+from ultralytics import YOLO
+import torch
+from PIL import Image
+import torchvision.transforms as tt
+import torch.nn as nn
+
+
+def index(value):
+    max = 0
+    for i in range(len(value)):
+        if i != 0:
+            if value[i] > value[max]:
+                max = i
+    return max
+
+
+def conv_block(in_channels, out_channels, pool=False):
+    layers = [nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+              nn.BatchNorm2d(out_channels),
+              nn.ReLU(inplace=True)]
+    if pool: layers.append(nn.MaxPool2d(2))
+    return nn.Sequential(*layers)
+
+
+class Resnet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = conv_block(3, 16, pool=True)
+        self.conv2 = conv_block(16, 32, pool=True)
+        self.res1 = nn.Sequential(conv_block(32, 32), conv_block(32, 32))
+
+        self.conv3 = conv_block(32, 64, pool=True)
+        self.conv4 = conv_block(64, 128, pool=True)
+        self.res2 = nn.Sequential(conv_block(128, 128), conv_block(128, 128))
+
+        self.conv5 = conv_block(128, 256, pool=True)
+        self.conv6 = conv_block(256, 512, pool=True)
+        self.res3 = nn.Sequential(conv_block(512, 512), conv_block(512, 512))
+
+        self.classifier = nn.Sequential(nn.MaxPool2d(4),
+                                        nn.Flatten(),
+                                        nn.Dropout(0.2))
+        self.linear = nn.Linear(512, 3)
+
+    def forward(self, xb):
+        out = self.conv1(xb)
+        out = self.conv2(out)
+        out = self.res1(out) + out
+        out = self.conv3(out)
+        out = self.conv4(out)
+        out = self.res2(out) + out
+        out = self.conv5(out)
+        out = self.conv6(out)
+        out = self.res3(out) + out
+        out = self.classifier(out)
+        out = self.linear(out)
+        return out
+
+
+def tensor_to_list(tensor):
+    if isinstance(tensor, torch.Tensor):
+        tensor = tensor.tolist()
+    if isinstance(tensor, list):
+        return [tensor_to_list(t) for t in tensor]
+    else:
+        return tensor
+
+
+def file_retriever(count):
+    scp.get(r'/home/robot/test.jpg', rf'D:\pythonProject1\Nav-2\{count}.jpg')
+    ssh.exec_command("rm test.jpg")
+
+
+def raspido(action):
+    actionmap = {
+        0: "stay",
+        1: "forward",
+        2: "backward",
+        3: "left",
+        4: "right",
+        5: "lilforward"
+    }
+    action_name = actionmap[action]
+    command = f'sudo python3 /home/robot/major_project/{action_name}.py'
+    stdin, stdout, stderr = ssh.exec_command(command)
+    print(f'{stdout.read().decode("utf8")}')
+
+
+def tracker(action, count, model, st):
+    file_retriever(count)
+    results = model(f"{count}.jpg")
+    dist = udistance()
+    for r in results:
+        boxes = r.boxes
+        record = []
+        for box in boxes:
+            c = int(box.cls.item())
+            record.append(c)
+        # Assume that it won't see other thing during that time
+        if st == "l":
+            if len(record) == 0:
+                raspido(action)
+                return True
+        elif st == "e":
+            if len(record) != 0:
+                raspido(action)
+                return True
+            if dist < 15:
+                raspido(action)
+    raspido(0)
+    return False
+
+
+def udistance():
+    command = 'sudo python3 /home/robot/major_project/udistance.py'
+    stdin, stdout, stderr = ssh.exec_command(command)
+    output = int(stdout.read().decode())
+    return output
+
+
+def stepper_moter(action):
+    command = f'sudo python3 /home/robot/major_project/stepper.py {action}'
+    stdin, stdout, stderr = ssh.exec_command(command)
+    print(f'{stdout.read().decode("utf8")}')
+
+
+def camera_ang(action):
+    # check the required file
+    if action == 1:
+        act = "ang_10"
+    elif action == 0:
+        act = "ang20"
+    command = f'sudo python3 /home/robot/major_project/{act}.py'
+    stdin, stdout, stderr = ssh.exec_command(command)
+    print(f'{stdout.read().decode("utf8")}')
+
+
+def navtoblue(count, model):
+    run = True
+    while run:
+        file_retriever(count)
+        results = model(f"{count}.jpg")
+        dist = udistance()
+        record = {}
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                b = tensor_to_list(box.xyxy)
+                c = int(box.cls.item())
+                record[c] = b
+        if 0 in record:
+            if dist < 13:
+                raspido(0)
+                run = False
+            elif dist < 18:
+                raspido(5)
+            else:
+                raspido(1)
+        elif 1 in record:
+            if dist < 30:
+                if record[1][0][0] < 40:
+                    raspido(2)
+                    raspido(3)
+                    raspido(1)
+                    raspido(4)
+                else:
+                    raspido(2)
+                    raspido(4)
+                    raspido(1)
+                    raspido(3)
+            else:
+                if record[1][0][0] < 40:
+                    raspido(3)
+                else:
+                    raspido(4)
+        elif 2 in record:
+            if dist > 30:
+                raspido(1)
+            else:
+                raspido(4)
+                raspido(1)
+                raspido(3)
+                while tracker(3, count, model, 'l'):
+                    count += 1
+        else:
+            raspido(4)
+        count += 1
+
+
+def navtoyellow(count, model):
+    run = True
+    while run:
+        file_retriever(count)
+        results = model(f"{count}.jpg")
+        dist = udistance()
+        record = {}
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                b = tensor_to_list(box.xyxy)
+                c = int(box.cls.item())
+                record[c] = b
+        if 3 in record:
+            if dist < 15:
+                raspido(0)
+                run = False
+            elif dist < 20:
+                raspido(5)
+            else:
+                raspido(1)
+        elif 4 in record:
+            if dist < 15:
+                raspido(0)
+                run = False
+            else:
+                if record[4][0][0] < 40:
+                    raspido(3)
+                else:
+                    raspido(4)
+        elif 5 in record:
+            if dist < 15:
+                raspido(0)
+                run = False
+            else:
+                raspido(3)
+                while tracker(3, count, model, 'e'):
+                    count += 1
+                raspido(1)
+                raspido(4)
+                while tracker(4, count, model, 'l'):
+                    count += 1
+        else:
+            raspido(3)
+        count += 1
+
+
+def heightloadingmodel(count, model, val):
+    camera_ang(1)
+    raspido(0)
+    file_retriever(count)
+    img = Image.open(f"{count}.jpg")
+    img = imgtotensor(img)
+    img = img.unsqueeze(0)
+    action = model(img)
+    action = tensor_to_list(action)
+    action = index(action[0])
+    stepper_moter(2)
+    if action == 0:
+        stepper_moter(0)
+    if action == 2:
+        stepper_moter(1)
+    if action == 0:
+        raspido(1)
+        raspido(1)
+    else:
+        while udistance() > 8:
+            print(udistance())
+            raspido(1)
+    raspido(1)
+    if val == 0:
+        stepper_moter(3)
+    if val == 1:
+        stepper_moter(2)
+    raspido(2)
+    if action != 0:
+        while udistance() < 15:
+            raspido(2)
+            raspido(2)
+            raspido(2)
+    else:
+        raspido(2)
+        raspido(2)
+    if val == 0:
+        stepper_moter(2)
+    if val == 1:
+        stepper_moter(3)
+    if action == 0:
+        stepper_moter(1)
+    if action == 2:
+        stepper_moter(0)
+        stepper_moter(3)
+    camera_ang(0)
+
+
+def main():
+    model = YOLO('E:/runs/detect/train6/weights/best.pt')
+    HDmodel = Resnet()
+    HDmodel.load_state_dict(torch.load(r"E:\HDmodel.pth"))
+    HDmodel.eval()
+    camera_ang(0)
+    count = 0
+    raspido(0)
+    navtoblue(count, model)
+    heightloadingmodel(count, HDmodel, 1)
+    navtoyellow(count, model)
+    heightloadingmodel(count, HDmodel, 0)
+    navtoblue(count, model)
+    heightloadingmodel(count, HDmodel, 1)
+    navtoyellow(count, model)
+    heightloadingmodel(count, HDmodel, 0)
+    navtoblue(count, model)
+    heightloadingmodel(count, HDmodel, 1)
+    navtoyellow(count, model)
+    heightloadingmodel(count, HDmodel, 0)
+
+
+pi_ip = '192.168.137.233'
+pi_username = 'robot'
+pi_password = 'robot'
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect(pi_ip, username=pi_username, password=pi_password)
+scp = paramiko.SFTPClient.from_transport(ssh.get_transport())
+imgtotensor = tt.ToTensor()
+main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+# code tool
+# im_array = r.plot()  # plot a BGR numpy array of predictions
+# im = Image.fromarray(im_array[..., ::-1])  # RGB PIL image
+# im.show()
+
