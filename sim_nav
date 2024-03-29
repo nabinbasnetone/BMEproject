@@ -1,0 +1,393 @@
+import numpy as np
+import torch as T
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions.categorical import Categorical
+import sim
+from PIL import Image
+import torchvision.transforms as tt
+from time import sleep as delay
+import sys
+import cv2
+import time
+from datetime import date
+
+
+def conv_block(in_channels, out_channels, pool=False):
+    layers = [nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+              nn.BatchNorm2d(out_channels),
+              nn.ReLU(inplace=True)]
+    if pool:
+        layers.append(nn.MaxPool2d(2))
+    return nn.Sequential(*layers)
+
+
+def statetotensor(lis):
+    j = [tensor.cpu().detach().numpy() for tensor in lis]
+    return j
+
+
+class PPOMemory:
+    def __init__(self, batch_size):
+        self.states = []
+        self.probs = []
+        self.vals = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.batch_size = batch_size
+
+    def generate_batches(self):
+        n_states = len(self.states)
+        batch_start = np.arange(0, n_states, self.batch_size)
+        indices = np.arange(n_states, dtype=np.int64)
+        batches = [indices[i:i + self.batch_size] for i in batch_start]
+        if isinstance(self.states[0], T.Tensor):
+            self.states = statetotensor(self.states)
+        return np.array(self.states), np.array(self.actions), np.array(self.probs), \
+               np.array(self.vals), \
+               np.array(self.rewards), \
+               np.array(self.dones), \
+               batches
+
+    def store_memory(self, state, action, probs, vals, reward, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.probs.append(probs)
+        self.vals.append(vals)
+        self.rewards.append(reward)
+        self.dones.append(done)
+
+    def clear_memory(self):
+        self.states = []
+        self.probs = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.vals = []
+
+
+class ActorNetwork(nn.Module):
+    def __init__(self, convcopy, alpha):
+        super(ActorNetwork, self).__init__()
+        self.lstm = nn.LSTM(576, 320, 2, batch_first=True)
+        self.h0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.c0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.cnn = convcopy
+        self.linear = nn.Sequential(
+            nn.Linear(320, 100),
+            nn.ReLU(),
+            nn.Linear(100, 42),
+            nn.ReLU(),
+            nn.Linear(42, 16),
+            nn.ReLU(),
+            nn.Linear(16, 5),
+            nn.Softmax(dim=-1))
+        for param in self.cnn.parameters():
+            param.requires_grad = False
+        self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=alpha)
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state):
+        state = self.cnn(state)
+        state, (self.h0, self.c0) = self.lstm(state, (self.h0, self.c0))
+        dist = self.linear(state[-1, :])
+        dist = Categorical(dist)
+        return dist
+
+
+class CriticNetwork(nn.Module):
+    def __init__(self, convcopy, alpha):
+        super(CriticNetwork, self).__init__()
+        self.h0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.c0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.lstm = nn.LSTM(576, 320, 2, batch_first=True)
+        self.cnn = convcopy
+        self.linear = nn.Sequential(
+            nn.Linear(320, 100),
+            nn.ReLU(),
+            nn.Linear(100, 42),
+            nn.ReLU(),
+            nn.Linear(42, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1))
+        for param in self.cnn.parameters():
+            param.requires_grad = False
+        self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=alpha)
+        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def forward(self, state):
+        value = self.cnn(state)
+        value, (self.h0, self.c0) = self.lstm(value, (self.h0, self.c0))
+        value = self.linear(value[-1, :])
+        return value
+
+
+class SimRewardModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = conv_block(3, 8, pool=True)
+        self.res1 = nn.Sequential(conv_block(8, 8), conv_block(8, 8))
+        self.conv2 = conv_block(8, 16, pool=True)
+        self.conv3 = conv_block(16, 32, pool=True)
+        self.res2 = nn.Sequential(conv_block(32, 32), conv_block(32, 32))
+        self.conv5 = conv_block(32, 64, pool=True)
+        self.classifier = nn.Sequential(nn.MaxPool2d(2),
+                                        nn.Flatten(),
+                                        nn.Dropout(0.2))
+        self.linear = nn.Sequential(
+            nn.Linear(576, 128),
+            nn.ReLU(),
+            nn.Linear(128, 4)
+        )
+
+    def forward(self, xb):
+        out = self.conv1(xb)
+        out = self.res1(out) + out
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = self.res2(out) + out
+        out = self.conv5(out)
+        out = self.classifier(out)
+        out = self.linear(out)
+        return out
+
+
+class Agent:
+    def __init__(self, convcopy, gamma=0.99, alpha=0.0001, gae_lambda=0.95,
+                 policy_clip=0.15, batch_size=30, n_epochs=4):
+        self.gamma = gamma
+        self.policy_clip = policy_clip
+        self.n_epochs = n_epochs
+        self.gae_lambda = gae_lambda
+        self.actor = ActorNetwork(convcopy, alpha)
+        self.critic = CriticNetwork(convcopy, alpha)
+        self.memory = PPOMemory(batch_size)
+        # self.actor.load_state_dict(T.load(r'C:\Users\Acer\PycharmProjects\NavigationModel\actor_2024-01-25.pth'))
+        # self.critic.load_state_dict(T.load(r'C:\Users\Acer\PycharmProjects\NavigationModel\critic_2024-01-25.pth'))
+        # self.actor.train()
+        # self.critic.train()
+
+    def remember(self, state, action, probs, vals, reward, done):
+        self.memory.store_memory(state, action, probs, vals, reward, done)
+
+    def choose_action(self, observation):
+        dist = self.actor(observation)
+        value = self.critic(observation)
+        action = dist.sample()
+        probs = T.squeeze(dist.log_prob(action)).item()
+        action = T.squeeze(action).item()
+        value = T.squeeze(value).item()
+        return action, probs, value
+
+    def reset_lstm(self):
+        self.actor.h0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.actor.c0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.critic.h0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+        self.critic.c0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+
+    def learn(self):
+        for _ in range(self.n_epochs):
+            state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, batches = self.memory.generate_batches()
+            values = vals_arr
+            advantage = np.zeros(len(reward_arr), dtype=np.float32)
+
+            for t in range(len(reward_arr) - 1):
+                discount = 1
+                a_t = 0
+                for k in range(t, len(reward_arr) - 1):
+                    a_t += discount * (reward_arr[k] + self.gamma * values[k + 1] * (1 - int(dones_arr[k])) - values[k])
+                    discount *= self.gamma * self.gae_lambda
+                advantage[t] = a_t
+            advantage = T.tensor(advantage).to(self.actor.device)
+
+            values = T.tensor(values).to(self.actor.device)
+            for batch in batches:
+                states = T.tensor(state_arr[batch], dtype=T.float).to(self.actor.device)
+                old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
+                actions = T.tensor(action_arr[batch]).to(self.actor.device)
+
+                dist = self.actor(states)
+                critic_value = self.critic(states)
+
+                critic_value = T.squeeze(critic_value)
+
+                new_probs = dist.log_prob(actions)
+                prob_ratio = new_probs.exp() / old_probs.exp()
+                weighted_probs = advantage[batch] * prob_ratio
+                weighted_clipped_probs = T.clamp(prob_ratio, 1 - self.policy_clip, 1 + self.policy_clip) * advantage[
+                    batch]
+                actor_loss = -T.min(weighted_probs, weighted_clipped_probs).mean()
+
+                returns = advantage[batch] + values[batch]
+                critic_loss = (returns - critic_value) ** 2
+                critic_loss = critic_loss.mean()
+                total_loss = actor_loss + 0.5 * critic_loss
+
+                self.actor.optimizer.zero_grad()
+                self.critic.optimizer.zero_grad()
+                total_loss.backward()
+                self.actor.optimizer.step()
+                self.critic.optimizer.step()
+                self.actor.h0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+                self.actor.c0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+                self.critic.h0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+                self.critic.c0 = T.zeros(2, 320).to('cuda:0' if T.cuda.is_available() else 'cpu')
+
+                print(f"total loss: {total_loss} \n")
+        self.memory.clear_memory()
+
+
+def file_retriever(clientID, camera_handle):
+    returnCode, resolution, image = sim.simxGetVisionSensorImage(
+            clientID, camera_handle, 0, sim.simx_opmode_buffer)
+    img = np.array(image).astype(np.uint8)
+    img.resize([resolution[0], resolution[1], 3])
+    img = cv2.flip(img, 0)
+    img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    img = cv2.resize(img, (100, 100))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    img = Image.fromarray(img)
+    img = imgtotensor(img)
+    img = img.to('cuda')
+    return img.unsqueeze(0)
+
+
+def raspido(clientID, left_motor_handle, right_motor_handle, action):
+    if action == 1:
+        lspeed, rspeed = 0.2, 0.2
+    elif action == 2:
+        lspeed, rspeed = -0.2, -0.2
+    elif action == 3:
+        lspeed, rspeed = 0, 0.2
+    elif action == 4:
+        lspeed, rspeed = 0.2, 0
+    else:
+        lspeed, rspeed = 0, 0
+    errorCode = sim.simxSetJointTargetVelocity(
+            clientID, left_motor_handle, lspeed, sim.simx_opmode_streaming)
+    errorCode = sim.simxSetJointTargetVelocity(
+            clientID, right_motor_handle, rspeed, sim.simx_opmode_streaming)
+
+
+def tensor_to_list(tensor):
+    if isinstance(tensor, T.Tensor):
+        tensor = tensor.tolist()
+    if isinstance(tensor, list):
+        return [tensor_to_list(t) for t in tensor]
+    else:
+        return tensor
+
+
+def index(val):
+    maximum = 0
+    for i in range(len(val)):
+        if i != 0:
+            if val[i] > val[maximum]:
+                maximum = i
+    return maximum
+
+
+def reward_m(observation, simreward, sensor, clientID, color):
+    error_code, detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector = sim.simxReadProximitySensor(
+        clientID, sensor, sim.simx_opmode_streaming)
+    distance = detectedPoint[2]
+
+    tensorobs = observation
+    value = simreward(tensorobs)
+    value = tensor_to_list(value)
+    value = index(value[0])
+
+    if color == value:
+        reward = 6 - distance # Max sensible distance by sensor is 1.5
+        if distance < 5: #check this line
+            return reward/10, True
+        else:
+            return 0, False
+    else:
+        if distance < 0.2:
+            return -0.1, False
+        else:
+            return 0, False
+
+
+class ConvCopy(nn.Module):
+    def __init__(self, simreward):
+        super().__init__()
+        self.features = nn.Sequential(
+            *list(simreward.children())[:-1]  # Exclude the last layer (linear part)
+        )
+
+    def forward(self, xb):
+        xb = self.features(xb)
+        return xb
+
+def main():
+    simreward = SimRewardModel()
+    simreward.load_state_dict(T.load(r'E:\Copelliasimwork\modelv2.pth'))
+    simreward.eval()
+    convcopy = ConvCopy(simreward)
+    agent = Agent(convcopy)
+    simreward.to('cuda:0' if T.cuda.is_available() else 'cpu')
+
+    sim.simxFinish(-1)
+    clientID = sim.simxStart('127.0.0.1', 19999, True, True, 5000, 5)
+    if clientID != -1:
+        print('Connected to remote API server')
+    else:
+        sys.exit('Failed connecting to remote API server')
+    delay(1)
+    errorCode, left_motor_handle = sim.simxGetObjectHandle(
+        clientID, "/PioneerP3DX/leftMotor", sim.simx_opmode_oneshot_wait)
+    errorCode, right_motor_handle = sim.simxGetObjectHandle(
+        clientID, "/PioneerP3DX/rightMotor", sim.simx_opmode_oneshot_wait)
+    errorCode, robot_handle = sim.simxGetObjectHandle(
+        clientID, "/PioneerP3DX", sim.simx_opmode_oneshot_wait)
+    errorCode, camera_handle = sim.simxGetObjectHandle(
+        clientID, '/PioneerP3DX/Vision_sensor', sim.simx_opmode_oneshot_wait)
+    delay(1)
+    returnCode, resolution, image = sim.simxGetVisionSensorImage(
+        clientID, camera_handle, 0, sim.simx_opmode_streaming)
+    error_code, sensor = sim.simxGetObjectHandle(clientID, "/PioneerP3DX/Proximity_sensor",
+                                                 sim.simx_opmode_oneshot_wait)
+    n_steps = 0
+    finish = 100
+    color = 1
+    totalreward = 0
+    while finish:
+        print(finish)
+        print(totalreward)
+        totalreward = 0
+        finish -= 1
+        initialPos = [-1.86947, 2.1, 0.13879]
+        initialEuler = [0.0, 0.0, 100.0]
+        sim.simxSetObjectPosition(clientID, robot_handle, -1, initialPos, sim.simx_opmode_blocking)
+        sim.simxSetObjectOrientation(clientID, robot_handle, -1, initialEuler, sim.simx_opmode_blocking)
+        raspido(clientID, left_motor_handle, right_motor_handle, 0)
+        observation = file_retriever(clientID, camera_handle)
+        agent.reset_lstm()
+        count = 30
+        while count:
+            action, prob, val = agent.choose_action(observation)
+            raspido(clientID, left_motor_handle, right_motor_handle, action)
+            time.sleep(2)
+            observation_ = file_retriever(clientID, camera_handle)
+            reward, done = reward_m(observation, simreward, sensor, clientID, color)
+            totalreward += reward
+            n_steps += 1
+            agent.remember(observation.squeeze(0), action, prob, val, reward, done)
+            count -= 1
+            observation = observation_
+        if finish % 10 == 0:
+            agent.learn()
+    today = str(date.today())
+    T.save(agent.actor.state_dict(), f"actor_{today}.pth")
+    T.save(agent.critic.state_dict(), f"critic_{today}.pth")
+
+
+imgtotensor = tt.ToTensor()
+main()
+
+
