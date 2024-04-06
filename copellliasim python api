@@ -1,0 +1,136 @@
+import sim
+from time import sleep as delay
+import numpy as np
+import cv2
+import torch as T
+import torch.nn as nn
+import sys
+from PIL import Image
+import torchvision.transforms as tt
+
+print('Program started')
+sim.simxFinish(-1)
+clientID = sim.simxStart('127.0.0.1', 19999, True, True, 5000, 5)
+
+lSpeed = 0
+rSpeed = 0
+if clientID != -1:
+    print('Connected to remote API server')
+else:
+    sys.exit('Failed connecting to remote API server')
+delay(1)
+
+errorCode, left_motor_handle = sim.simxGetObjectHandle(
+    clientID, "/PioneerP3DX/leftMotor", sim.simx_opmode_oneshot_wait)
+errorCode, right_motor_handle = sim.simxGetObjectHandle(
+    clientID, "/PioneerP3DX/rightMotor", sim.simx_opmode_oneshot_wait)
+errorCode, camera_handle = sim.simxGetObjectHandle(
+    clientID, '/PioneerP3DX/Vision_sensor', sim.simx_opmode_oneshot_wait)
+delay(1)
+
+returnCode, resolution, image = sim.simxGetVisionSensorImage(
+    clientID, camera_handle, 0, sim.simx_opmode_streaming)
+delay(1)
+
+
+def conv_block(in_channels, out_channels, pool=False):
+    layers = [nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+              nn.BatchNorm2d(out_channels),
+              nn.ReLU(inplace=True)]
+    if pool: layers.append(nn.MaxPool2d(2))
+    return nn.Sequential(*layers)
+
+
+class Resnet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = conv_block(3, 8, pool=True)
+        self.res1 = nn.Sequential(conv_block(8, 8), conv_block(8, 8))
+        self.conv2 = conv_block(8, 16, pool=True)
+        self.conv3 = conv_block(16, 32, pool=True)
+        self.res2 = nn.Sequential(conv_block(32, 32), conv_block(32, 32))
+        self.conv5 = conv_block(32, 64, pool=True)
+        self.classifier = nn.Sequential(nn.MaxPool2d(2),
+                                        nn.Flatten(),
+                                        nn.Dropout(0.2))
+        self.linear = nn.Sequential(
+            nn.Linear(576, 128),
+            nn.ReLU(),
+            nn.Linear(128, 4)
+        )
+
+    def forward(self, xb):
+            out = self.conv1(xb)
+            out = self.res1(out) + out
+            out = self.conv2(out)
+            out = self.conv3(out)
+            out = self.res2(out) + out
+            out = self.conv5(out)
+            out = self.classifier(out)
+            out = self.linear(out)
+            return out
+
+
+def index(val):
+    maximum = 0
+    for i in range(len(val)):
+        if i != 0:
+            if val[i] > val[maximum]:
+                maximum = i
+    return maximum
+
+
+def tensor_to_list(tensor):
+    if isinstance(tensor, T.Tensor):
+        tensor = tensor.tolist()
+    if isinstance(tensor, list):
+        return [tensor_to_list(t) for t in tensor]
+    else:
+        return tensor
+
+
+def raspido(clientID, left_motor_handle, right_motor_handle, action):
+    if action == 0:
+        lspeed, rspeed = 0.2, 0.2
+    elif action == 1:
+        lspeed, rspeed = -0.2, -0.2
+    elif action == 2:
+        lspeed, rspeed = 0, 0.2
+    elif action == 3:
+        lspeed, rspeed = 0.2, 0
+    else:
+        lspeed, rspeed = 0, 0
+    errorCode = sim.simxSetJointTargetVelocity(
+            clientID, left_motor_handle, lspeed, sim.simx_opmode_streaming)
+    errorCode = sim.simxSetJointTargetVelocity(
+            clientID, right_motor_handle, rspeed, sim.simx_opmode_streaming)
+
+def file_retriever(clientID, camera_handle):
+    returnCode, resolution, image = sim.simxGetVisionSensorImage(
+            clientID, camera_handle, 0, sim.simx_opmode_buffer)
+    img = np.array(image).astype(np.uint8)
+    img.resize([resolution[0], resolution[1], 3])
+    img = cv2.flip(img, 0)
+    img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    img = cv2.resize(img, (100, 100))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    img = Image.fromarray(img)
+    img = imgtotensor(img)
+    return img.unsqueeze(0)
+
+
+model = Resnet()
+model.load_state_dict(T.load(r'D:\new\modelv3.pth'))
+model.eval()
+imgtotensor = tt.ToTensor()
+while True:
+        im = file_retriever(clientID, camera_handle)
+        errorCode = sim.simxSetJointTargetVelocity(
+            clientID, left_motor_handle, lSpeed, sim.simx_opmode_streaming)
+        errorCode = sim.simxSetJointTargetVelocity(
+            clientID, right_motor_handle, rSpeed, sim.simx_opmode_streaming)
+        action = model(im)
+        action = tensor_to_list(action)
+        action = index(action[0])
+        print(action)
+        raspido(clientID, left_motor_handle, right_motor_handle, action)
